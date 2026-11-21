@@ -31,6 +31,13 @@ try {
   console.error(`GPU_EXTRA_BODY must be valid JSON: ${error.message}`);
   process.exit(1);
 }
+let cerebrasExtra = { reasoning_effort: 'low' };
+try {
+  cerebrasExtra = JSON.parse(process.env.CEREBRAS_EXTRA_BODY || '{"reasoning_effort":"low"}');
+} catch (error) {
+  console.error(`CEREBRAS_EXTRA_BODY must be valid JSON: ${error.message}`);
+  process.exit(1);
+}
 
 const lanes = [
   {
@@ -39,7 +46,7 @@ const lanes = [
     base: 'https://api.cerebras.ai/v1',
     key: process.env.CEREBRAS_API_KEY,
     model: process.env.CEREBRAS_MODEL || 'moonshotai-kimi-k3.1-pro-trial',
-    extra: {},
+    extra: cerebrasExtra,
   },
   {
     id: 'gpu',
