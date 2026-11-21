@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Watercolor Harness</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #111216;
+      color: #ecebe7;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: 100%;
+      max-width: min(1400px, calc((100vh - 170px) * 2 + 48px));
+      margin: 0 auto;
+      padding: 20px 24px 28px;
+    }
+    form { display: flex; gap: 12px; margin-bottom: 20px; }
+    input {
+      flex: 1;
+      min-width: 0;
+      height: 48px;
+      padding: 0 16px;
+      border: 1px solid #383a42;
+      border-radius: 7px;
+      background: #1b1d22;
+      color: #fff;
+      font: inherit;
+      font-size: 17px;
+      outline: none;
+    }
+    input:focus { border-color: #737986; }
+    button {
+      height: 48px;
+      padding: 0 25px;
+      border: 0;
+      border-radius: 7px;
+      background: #c4451b;
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .55; cursor: wait; }
+    #panels {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(440px, 100%), 1fr));
+      gap: 24px;
+      align-items: start;
+    }
+    .panel { --accent: #8a8f98; min-width: 0; }
+    .panel.cerebras { --accent: #f15a29; }
+    .panel.gpu { --accent: #8a8f98; }
+    .topline { display: flex; justify-content: space-between; gap: 16px; align-items: stretch; }
+    .heading { border-bottom: 3px solid var(--accent); padding: 0 0 7px; min-width: 0; }
+    .label { font-size: 22px; font-weight: 700; line-height: 1.1; }
+    .model { margin-top: 3px; color: #91959e; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .numbers { display: flex; gap: 16px; text-align: right; font-variant-numeric: tabular-nums; }
+    .metric { min-width: 58px; }
+    .value { display: block; font-size: 24px; line-height: 1.1; font-weight: 650; }
+    .unit { display: block; margin-top: 4px; color: #878b94; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 1;
+      margin-top: 14px;
+      border-radius: 3px;
+      background: #f8f4eb;
+      box-shadow: 0 8px 32px #0007;
+    }
+    .status { min-height: 18px; margin-top: 10px; color: #a4a8af; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #message { min-height: 18px; margin: -10px 0 14px; color: #d68d79; font-size: 13px; }
+    @media (max-width: 700px) {
+      main { padding: 14px; }
+      #panels { grid-template-columns: 1fr; }
+      .numbers { gap: 9px; }
+      .value { font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <form id="paint-form">
+      <input id="prompt" aria-label="Painting prompt" value="Paint a peony." autocomplete="off">
+      <button id="paint-button" type="submit">Paint</button>
+    </form>
+    <div id="message"></div>
+    <section id="panels" aria-label="Live paintings"></section>
+  </main>
+  <script type="module">
+    import { createPainter } from '/renderer.js';
+
+    const panels = new Map();
+    const grid = document.querySelector('#panels');
+    const message = document.querySelector('#message');
+    const form = document.querySelector('#paint-form');
+    const button = document.querySelector('#paint-button');
+
+    function format(value, digits = 1) {
+      return Number.isFinite(value) ? value.toFixed(digits) : '—';
+    }
+
+    function updateNumbers(panel, now = performance.now()) {
+      const seconds = panel.doneStats ? panel.doneStats.seconds : (now - panel.started) / 1000;
+      panel.time.textContent = `${format(seconds)}s`;
+      let tps = panel.doneStats?.tps;
+      if (!panel.doneStats && panel.firstText !== null && now > panel.firstText) {
+        tps = (panel.text.length / 4) / ((now - panel.firstText) / 1000);
+      }
+      panel.tps.textContent = format(tps);
+      panel.strokes.textContent = String(panel.strokeCount);
+    }
+
+    function ticker(panel) {
+      updateNumbers(panel);
+      if (panel.running) panel.frame = requestAnimationFrame(() => ticker(panel));
+    }
+
+    function makePanel(lane) {
+      const element = document.createElement('article');
+      element.className = `panel ${lane.id}`;
+      element.innerHTML = `
+        <div class="topline">
+          <div class="heading">
+            <div class="label"></div>
+            <div class="model"></div>
+          </div>
+          <div class="numbers">
+            <div class="metric"><span class="value time">—</span><span class="unit">time</span></div>
+            <div class="metric"><span class="value tps">—</span><span class="unit">tokens/s</span></div>
+            <div class="metric"><span class="value strokes">0</span><span class="unit">strokes</span></div>
+          </div>
+        </div>
+        <canvas width="1000" height="1000"></canvas>
+        <div class="status">Ready</div>`;
+      element.querySelector('.label').textContent = lane.label;
+      element.querySelector('.model').textContent = lane.model;
+      element.querySelector('.model').title = lane.model;
+      grid.append(element);
+      const canvas = element.querySelector('canvas');
+      const panel = {
+        lane, element, canvas,
+        painter: createPainter(canvas.getContext('2d'), 1000),
+        time: element.querySelector('.time'),
+        tps: element.querySelector('.tps'),
+        strokes: element.querySelector('.strokes'),
+        status: element.querySelector('.status'),
+        text: '', buffer: '', strokeCount: 0, started: 0, firstText: null,
+        running: false, frame: 0, doneStats: null,
+      };
+      panel.painter.reset();
+      panels.set(lane.id, panel);
+    }
+
+    function start(panel) {
+      if (panel.frame) cancelAnimationFrame(panel.frame);
+      panel.painter.reset();
+      panel.text = '';
+      panel.buffer = '';
+      panel.strokeCount = 0;
+      panel.started = performance.now();
+      panel.firstText = null;
+      panel.doneStats = null;
+      panel.running = true;
+      panel.status.textContent = 'Painting…';
+      updateNumbers(panel);
+      panel.frame = requestAnimationFrame(() => ticker(panel));
+    }
+
+    function appendText(panel, text) {
+      if (!panel.running) start(panel);
+      const now = performance.now();
+      if (panel.firstText === null) panel.firstText = now;
+      panel.text += text;
+      panel.buffer += text;
+      const lines = panel.buffer.split('\n');
+      panel.buffer = lines.pop();
+      for (const line of lines) {
+        if (panel.painter.drawLine(line)) panel.strokeCount++;
+      }
+      updateNumbers(panel, now);
+    }
+
+    function done(panel, stats) {
+      if (panel.buffer && panel.painter.drawLine(panel.buffer)) panel.strokeCount++;
+      panel.buffer = '';
+      panel.doneStats = stats;
+      panel.running = false;
+      if (panel.frame) cancelAnimationFrame(panel.frame);
+      panel.frame = 0;
+      updateNumbers(panel);
+      panel.status.textContent = `Done · ${format(stats.tokens, stats.estimated ? 0 : 0)}${stats.estimated ? ' estimated' : ''} tokens · first token ${format(stats.firstTokenSeconds)}s`;
+    }
+
+    async function snapshot(stamp) {
+      await Promise.all([...panels.values()].map(panel => new Promise(resolve => {
+        panel.canvas.toBlob(async blob => {
+          try {
+            if (!blob) throw new Error('Canvas snapshot failed');
+            const query = new URLSearchParams({ stamp, lane: panel.lane.id });
+            const response = await fetch(`/snapshot?${query}`, {
+              method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob,
+            });
+            if (!response.ok) throw new Error(`Snapshot HTTP ${response.status}`);
+          } catch (error) {
+            panel.status.textContent = error.message;
+          } finally {
+            resolve();
+          }
+        }, 'image/png');
+      })));
+    }
+
+    async function initialize() {
+      const response = await fetch('/lanes');
+      if (!response.ok) throw new Error(`Could not load lanes: HTTP ${response.status}`);
+      const lanes = await response.json();
+      for (const lane of lanes) makePanel(lane);
+
+      const events = new EventSource('/events');
+      events.onmessage = event => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'snapshot') {
+          snapshot(data.stamp);
+          return;
+        }
+        const panel = panels.get(data.lane);
+        if (!panel) return;
+        if (data.type === 'start') start(panel);
+        else if (data.type === 'text') appendText(panel, data.text);
+        else if (data.type === 'done') done(panel, data.stats);
+        else if (data.type === 'error') {
+          panel.running = false;
+          if (panel.frame) cancelAnimationFrame(panel.frame);
+          panel.status.textContent = data.error;
+        }
+      };
+      events.onerror = () => { message.textContent = 'Live connection interrupted; reconnecting…'; };
+      events.onopen = () => { message.textContent = ''; };
+    }
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      button.disabled = true;
+      message.textContent = '';
+      try {
+        const response = await fetch('/paint', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: document.querySelector('#prompt').value }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      } catch (error) {
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    initialize().catch(error => { message.textContent = error.message; });
+  </script>
+</body>
+</html>
